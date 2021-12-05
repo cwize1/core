@@ -870,14 +870,14 @@ class _QueuedScriptRun(_ScriptRun):
             raise
         finally:
             stop_task.cancel()
-        self.lock_acquired = lock_task.done() and not lock_task.cancelled()
+        self.lock_acquired = lock_task.done() and not lock_task.cancelled() and lock_task.result()
 
-        # If we've been told to stop, then just finish up. Otherwise, we've acquired the
-        # lock so we can go ahead and start the run.
-        if self._stop.is_set():
+        # If we've been told to stop, then just finish up.
+        if self._stop.is_set() or not self.lock_acquired:
             self._finish()
-        else:
-            await super().async_run()
+
+        # We've acquired the lock so we can go ahead and start the run.
+        await super().async_run()
 
     def _finish(self) -> None:
         # pylint: disable=protected-access
@@ -885,6 +885,61 @@ class _QueuedScriptRun(_ScriptRun):
             self._script._queue_lck.release()
             self.lock_acquired = False
         super()._finish()
+
+
+class _CoalescingQueue:
+    """"""
+
+    def __init__(self) -> None:
+        self._loop = asyncio.events.get_event_loop()
+        self._locked = False
+        self._waiter = None
+
+    async def acquire(self) -> bool:
+        # Remove an existing waiter (if it exists), as this task will replace it.
+        waiter = self._waiter
+        self._waiter = None
+        if waiter is not None and not waiter.done():
+            waiter.set_result(False)
+
+        if not self._locked:
+            # Lock is available. Take it.
+            self._locked = True
+            return True
+
+        # Setup a waiter for when the lock becomes available.
+        fut = self._loop.create_future()
+        self._waiter = fut
+
+        # Wait for the lock to become available.
+        try:
+            result = await fut
+        finally:
+            # Ensure the _waiter variable is cleared.
+            # This generally is only applicable when the task is canceled.
+            if fut is self._waiter:
+                self._waiter = None
+
+        if not result or self._locked:
+            # Acquiring the lock failed.
+            return False
+
+        # Acquire the lock.
+        self._locked = True
+        return True
+
+    def release(self) -> None:
+        if not self._locked:
+            raise RuntimeError('Lock is not acquired.')
+
+        self._locked = False
+
+        # Signal the waiter (if it exists).
+        waiter = self._waiter
+        self._waiter = None
+
+        if waiter is not None and not waiter.done():
+            waiter.set_result(True)
 
 
 async def _async_stop_scripts_after_shutdown(hass, point_in_time):
